@@ -1,0 +1,462 @@
+[edgeR Enriched Families] 
+       ↓
+[ESM3 / ProGen2]               ← Generate 10000 new sequence variants, with informatopn epitope, top clone, top motif, (here ESM3 is the best) 
+       ↓
+[ANARCI]                       ← Number and parse variable domains to ensure proper framework/CDR structure
+       ↓
+[CamSol & AggreScan]           ← Filter out sequence variants with poor solubility or aggregation hotspots
+       ↓
+[MMseqs2]                      ← Collapse remaining variants into 5-10 structural family clusters
+       ↓
+[IgFold / AF2 / AF2-Multimer]  ← Generate high-speed backbone models and preliminary antigen-docked screens
+       ↓
+[RosettaDock]                  ← Perform fine-grain spatial perturbations and global rigid-body docking
+       ↓
+[AlphaFold 3]                  ← Conduct definitive end-to-end multi-entity complex structural predictions
+       ↓
+[Rosetta InterfaceAnalyzer]   ← Calculate binding energies (dG_cross), interface surface area, and pack-stats
+       ↓
+[Multi-Objective Opt (MOO)]   ← Balance binding affinity (dG) against solubility (CamSol) to select Final Leads
+
+######################################################################################################
+######################################################################################################
+
+### Step 1 Implementation Code: Motif & Structure-Guided Generation
+
+import torch
+import re
+import pandas as pd
+from esm.models.esm3 import ESM3
+from esm.sdk.api import ESM3Input, GenerationConfig
+
+# --- Configuration & Constraint Parameters ---
+TOTAL_VARIANTS_TARGET = 10000
+TOP_MOTIF = "W..Y..F"  # Example enriched motif found in your top clones' CDR3s
+PARENT_CLONE_SEQ = "EVQLVESGGGLVQPGGSLRLSCAASGFTFSSYAMSWVRQAPGKGLEWVSAISGSGGSTYYADSVKGRFTISRDNSKNTLYLQMNSLRAEDTAVYYCAKDGYSYGYFDYWGQGTLVTVSS"
+
+# 1. Initialize Multimodal ESM3 Model
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = ESM3.from_pretrained("esm3_sm_open_v1").to(device)
+
+# 2. Setup Epitope Structural Constraints
+# Extract 3D backbone coordinates of your target epitope from a template PDB (e.g., AF2 model or Co-crystal)
+# ESM3 allows you to pass coordinates directly to condition the generation
+# For this example, we load a pre-parsed coordinate tensor of the interface contact residues
+epitope_structure_tokens = model.encoder.get_structure_tokens_from_pdb("epitope_interface_template.pdb")
+
+generated_variants = set()
+compiled_motif = re.compile(TOP_MOTIF)
+
+print(f"Generating {TOTAL_VARIANTS_TARGET} variants conditioned on Epitope structure, Clonal frameworks, and Motifs...")
+
+while len(generated_variants) < TOTAL_VARIANTS_TARGET:
+    # 3. Construct Multimodal Prompt Matrix
+    # We prime the model with the Parent Clone sequence layout, but mask the CDR3 loop for generation
+    # We simultaneously overlay the structural tokens of the target epitope to guide the loop shape
+    prompt_input = ESM3Input(
+        sequence=PARENT_CLONE_SEQ[:95] + "_"*15 + PARENT_CLONE_SEQ[110:], # Masking the CDR3 loop
+        structure_tokens=epitope_structure_tokens,                         # Hard-coding the epitope target geometry
+    )
+    
+    # 4. Generate with Temperature and Top_K sampling
+    config = GenerationConfig(
+        temperature=0.8,
+        top_k=40,
+        max_tokens=150
+    )
+    
+    with torch.no_grad():
+        output = model.generate(prompt_input, config)
+        generated_seq = output.sequence
+        
+    # 5. Stringent Motif Filter
+    # Only keep the sequence if it successfully generated the top enriched binder motifs inside the CDR3
+    if compiled_motif.search(generated_seq):
+        # Ensure it falls within structural antibody lengths
+        if 100 <= len(generated_seq) <= 140:
+            generated_variants.add(generated_seq)
+
+# Save the target 10k epitope-optimized library
+df = pd.DataFrame({"sequence": list(generated_variants)})
+df.to_csv("epitope_motif_guided_10k_variants.csv", index=False)
+print(f"Library generation complete. Stored {len(df)} targeted sequences.")
+
+## Step 2: Germline Numbering & Structural Parsing (ANARCI)
+Filter out sequences that do not map cleanly to standard antibody architecture or contain framework-disrupting insertions or deletions.
+
+##bash
+
+# Convert CSV sequences to FASTA format
+
+awk -F, 'NR>1 {print ">var_"NR-1"\n"$1}' generated_10k_variants.csv > variants.fasta
+
+# Run ANARCI using IMGT numbering scheme to validate variable domains
+anarci -i variants.fasta --scheme imgt -o anarci_numbered.txt --csv > anarci_results.csv
+
+# Python snippet to filter out sequences that failed to align (missing conserved Cys23 / Cys104 positions)
+python3 -c "
+
+import pandas as pd
+df = pd.read_csv('anarci_results.csv')
+valid_variants = df[df['Id'].notna() & (df['domain_no'] == 1)]['Id'].tolist()
+print(f'Passed ANARCI structure filter: {len(valid_variants)} sequences')
+
+#### Step 3: Biophysical Liability Filtering (CamSol & AggreScan)
+Screen sequences for aggregation hotspots and solubility scores, discarding liabilities before investing computing power into 3D structural generation.
+
+import subprocess
+import pandas as pd
+
+# Standard wrapper structure to iterate through candidates and score profiles
+# Note: Requires local CamSol and AggreScan3D/AggreScan command line builds installed
+df_valid = pd.read_csv("generated_10k_variants.csv") # Assuming filtered down by ANARCI
+
+filtered_results = []
+for idx, row in df_valid.iterrows():
+    seq = row['sequence']
+    
+    # Example command execution for a standard command-line biophysical predictor tool
+    # Replace 'camsol_cli' with your local patch to your CamSol academic script execution
+    camsol_score = 0.5  # Placeholder: parse from stdout/output file
+    aggrescan_hotspots = 1 # Placeholder: parse from output file
+    
+    # Screening constraints thresholds
+    if camsol_score >= 0.0 and aggrescan_hotspots <= 2:
+        filtered_results.append({"id": f"var_{idx}", "sequence": seq, "camsol": camsol_score, "agg": aggrescan_hotspots})
+
+df_biophysics = pd.DataFrame(filtered_results)
+df_biophysics.to_csv("biophysical_passed_variants.csv", index=False)
+
+##### Step 4: Sequence Clustered Collapse (MMseqs2)
+Collapse the surviving sequence population into 5–10 distinct representative structural families based on sequence similarity.
+##bash
+
+# 1. Create database of biophysically sound variants
+awk -F, 'NR>1 {print ">"$1"\n"$2}' biophysical_passed_variants.csv > filtered_biophysics.fasta
+mmseqs createdb filtered_biophysics.fasta pool_db
+
+# 2. Stringent clustering over sequence similarity to identify dominant families
+mmseqs cluster pool_db cluster_db tmp --min-seq-id 0.85 -c 0.85 --cov-mode 0
+
+# 3. Extract the cluster representatives (The 5-10 structural centers)
+mmseqs result2repseq pool_db cluster_db repseq_db
+mmseqs convert2fasta pool_db repseq_db final_5_10_representatives.fasta
+
+######################################################################################################################
+#### Step 5: Sequential Structural Screening Architecture (IgFold \(\rightarrow \) AF2 \(\rightarrow \) AF2-Multimer)
+########################
+This script processes your 5–10 representative sequences sequentially. 
+It structures inputs correctly for each modeling tool, ensuring that individual structural configurations are preserved.
+
+###################  first choice only with igfold and AF2-multimer##########################
+# 1. Predict variable domain 3D coordinates in seconds via IgFold
+# Repeat this step for each sequence inside final_5_10_representatives.fasta
+igfold --seq_h final_5_10_representatives.fasta --out_pdb candidate_backbone.pdb
+
+# 2. Run AF2-Multimer preliminary screen via local ColabFold implementation
+colabfold_batch --model-type alphafold2_multimer_v3 \
+                --num-models 3 \
+                --num-recycle 3 \
+                antigen_antibody_input_sequence.fasta ./af2_output/
+###########################################################################################
+
+###################  second choice  with igfold, AF2, and AF2-multimer##########################
+#!/bin/bash
+set -e
+
+# --- Configuration & Inputs ---
+REPRESENTATIVES_FASTA="final_5_10_representatives.fasta"
+ANTIGEN_FASTA="antigen_target.fasta"
+OUTPUT_DIR="./structural_screening_output"
+mkdir -p "$OUTPUT_DIR"
+
+# Read the antigen sequence into a variable for later multimer formatting
+ANTIGEN_SEQ=$(tail -n +2 "$ANTIGEN_FASTA" | tr -d '\n\r ')
+
+# --- Processing Loop for Each Clustered Representative ---
+# This loop uses awk to extract individual fasta records dynamically
+num_sequences=$(grep -c "^>" "$REPRESENTATIVES_FASTA")
+
+for ((i=1; i<=num_sequences; i++)); do
+    # Extract entry ID and sequence
+
+    entry_header=$(awk -v seq_num="$i" 'BEGIN {RS=">"; FS="\n"} NR==seq_num+1 {print $1}' "$REPRESENTATIVES_FASTA" | awk '{print $1}')
+    entry_seq=$(awk -v seq_num="$i" 'BEGIN {RS=">"; FS="\n"} NR==seq_num+1 {for(j=2;j<=NF;j++) printf "%s", $j; print ""}' "$REPRESENTATIVES_FASTA" | tr -d '\n\r ')
+    
+    echo "========================================================================="
+    echo "Processing Representative $i/$num_sequences: ID = $entry_header"
+    echo "========================================================================="
+    
+    # Create working directories for this specific candidate variant
+    var_dir="${OUTPUT_DIR}/${entry_header}"
+    mkdir -p "$var_dir/igfold" "$var_dir/af2_monomer" "$var_dir/af2_multimer"
+    
+    # Format a single-sequence temporary FASTA file
+    echo ">${entry_header}" > "${var_dir}/temp_candidate.fasta"
+    echo "$entry_seq" >> "${var_dir}/temp_candidate.fasta"
+
+    # -------------------------------------------------------------------------
+    # Stage 5A: Sub-second Coordinate Drafting (IgFold)
+    # -------------------------------------------------------------------------
+    echo "[Stage 5A] Generating rapid variable domain backbone with IgFold..."
+    igfold \
+      --seq_h "${var_dir}/temp_candidate.fasta" \
+      --out_pdb "${var_dir}/igfold/${entry_header}_igfold.pdb"
+
+    # -------------------------------------------------------------------------
+    # Stage 5B: Standalone Antibody Refinement (AlphaFold 2 Monomer)
+    # -------------------------------------------------------------------------
+    echo "[Stage 5B] Refining antibody structure with standalone AlphaFold 2..."
+    # Local ColabFold instance explicitly configured for standard monomer structure prediction
+    colabfold_batch \
+      --model-type alphafold2 \
+      --num-models 3 \
+      --num-recycle 3 \
+      "${var_dir}/temp_candidate.fasta" \
+      "${var_dir}/af2_monomer/"
+
+    # Rename the top ranked PDB structure for clean pipeline inventory tracking
+    mv "${var_dir}/af2_monomer/${entry_header}_unrelaxed_rank_001_"*.pdb "${var_dir}/af2_monomer/${entry_header}_af2_refined.pdb" 2>/dev/null || true
+
+    # -------------------------------------------------------------------------
+    # Stage 5C: Preliminary Complex Screening (AlphaFold 2 Multimer)
+    # -------------------------------------------------------------------------
+    echo "[Stage 5C] Building antigen-antibody complex input layout..."
+    # Format the paired multimer fasta file using the custom colon separator notation
+    # Format layout: >Complex_ID \n AntibodySequence:AntigenSequence
+    echo ">${entry_header}_complex" > "${var_dir}/temp_multimer.fasta"
+    echo "${entry_seq}:${ANTIGEN_SEQ}" >> "${var_dir}/temp_multimer.fasta"
+
+    echo "[Stage 5C] Executing rigid-body docking layout screening via AF2-Multimer..."
+    colabfold_batch \
+      --model-type alphafold2_multimer_v3 \
+      --num-models 3 \
+      --num-recycle 3 \
+      "${var_dir}/temp_multimer.fasta" \
+      "${var_dir}/af2_multimer/"
+
+    # Relocate top docked conformation to the root folder for next Rosetta steps
+    mv "${var_dir}/af2_multimer/${entry_header}_complex_unrelaxed_rank_001_"*.pdb "${var_dir}/${entry_header}_docked_screening_complex.pdb" 2>/dev/null || true
+
+    # Cleanup temporary configuration files
+    rm -f "${var_dir}/temp_candidate.fasta" "${var_dir}/temp_multimer.fasta"
+
+done
+
+echo "Sequential Structural Architecture structural cascade successfully executed."
+##############################################################################################
+
+
+
+#### Step 6: Fine-Grain Global Docking Ensembles (RosettaDock)
+Perform rigid-body spatial perturbations around the target interface using the structures generated in the previous step to identify stable binding orientations.
+
+bash
+
+# 1. Prepare the parsed antibody-antigen complex PDB for Rosetta
+phoenix_v2/clean_pdb.py af2_output_complex.pdb A B
+
+# 2. Define Rosetta interface docking flag file (docking_flags.txt)
+# Contains instructions: -ex1 -ex2 -extrachi_cutoff 0 -unboundrot
+# Run RosettaDock ensemble perturbation matching your configuration parameters
+docking_protocol.default.linuxgccrelease \
+  @docking_flags.txt \
+  -s af2_output_complex.pdb \
+  -nstruct 500 \
+  -partners A_B \
+  -dock_pert 3 8 \
+  -out:file:silent rosettadock_ensemble.out
+#####
+
+#### Step 7: AlphaFold 3 Exhaustive Seed Sampling (30 Variants × 50 Seeds)
+This handles your core computational target: evaluating 30 optimized variants across 50 stochastic seeds (totaling 1,500 structures) 
+
+import json
+import os
+import subprocess  # 1. Import subprocess to run terminal commands
+
+variant_sequences = ["EVQL...", "EVQL...", "EVQL..."]
+os.makedirs("./af3_json", exist_ok=True)
+os.makedirs("./af3_outputs", exist_ok=True)
+
+for var_idx, seq in enumerate(variant_sequences):
+    for seed_val in range(1, 51):
+        json_filename = f"./af3_json/run_var{var_idx}_seed{seed_val}.json"
+        
+        af3_input_json = {
+            "name": f"Variant_{var_idx}_Seed_{seed_val}",
+            "modelSeeds": [seed_val],
+            "sequences": [
+                {"protein": {"sequence": seq, "count": 1}},
+                {"protein": {"sequence": "ANTIGEN_TARGET_SEQUENCE_HERE", "count": 1}}
+            ]
+        }
+        
+        # Save the JSON file
+        with open(json_filename, "w") as f:
+            json.dump(af3_input_json, f, indent=2)
+        
+        # 2. Add the execution block here to run AF3 for each JSON file
+        print(f"Executing AF3 for Variant {var_idx}, Seed {seed_val}...")
+        subprocess.run([
+            "python", "run_alphafold.py", 
+            f"--json_path={json_filename}", 
+            f"--output_dir=./af3_outputs/var{var_idx}_seed{seed_val}"
+        ], check=True)
+
+print("Generated configurations and completed all AlphaFold 3 engine executions.")
+
+
+#### using PyMOL to cluster structural convergence.
+# Run this inside a script via PyMOL's python interpreter (pymol -cr cluster.py)
+import pymol
+from pymol import cmd
+
+# Load all 50 seeds for a specific variant layout
+for i in range(1, 51):
+    cmd.load(f"Variant_0_Seed_{i}.pdb", f"seed_{i}")
+
+# Pairwise align framework regions and capture coordinate clustering variances
+for i in range(2, 51):
+    rms = cmd.align(f"seed_{i} & chain A & resi 1-120", "seed_1 & chain A & resi 1-120")[0]
+    print(f"Seed {i} to Seed 1 backbone alignment RMSD: {rms:.3f}")
+
+
+#### MMseqs2
+
+#!/bin/bash
+set -e
+
+# --- Configuration & Paths ---
+AF3_OUTPUT_DIR="./af3_inference_results"  # Folder containing your 1500 model PDBs
+STRUCT_DB_DIR="./structural_clustering"
+mkdir -p "$STRUCT_DB_DIR"
+
+# 1. Generate a line-separated text file listing all available model paths
+# Ensure paths are absolute or correctly formatted relative to execution location
+echo "Indexing AlphaFold 3 structural models..."
+find "$AF3_OUTPUT_DIR" -name "*.pdb" > "$STRUCT_DB_DIR/all_models_list.txt"
+
+# 2. Build the MMseqs2 structural coordinate database 
+# This parses the 3D atomic coordinates from the PDB files directly into binary formats
+echo "Creating MMseqs2 3D structural database..."
+mmseqs createdb \
+  "$STRUCT_DB_DIR/all_models_list.txt" \
+  "$STRUCT_DB_DIR/af3_models_db" \
+  --dbtype 2  # Hardcodes database layout format type to expect 3D structures
+
+# 3. Perform 3D Structural Spatial Clustering using TM-score
+# Adjust metric constraints to define structural family boundaries
+echo "Executing mmseqs cluster3d..."
+mmseqs cluster3d \
+  "$STRUCT_DB_DIR/af3_models_db" \
+  "$STRUCT_DB_DIR/af3_structural_clusters" \
+  "$STRUCT_DB_DIR/tmp_3d" \
+  --min-seq-id 0.0 \
+  --tmscore 0.80 \
+  --tmscore-mode 1 \
+  -c 0.80 \
+  --cov-mode 0
+
+# --- Parameters Explained ---
+# --min-seq-id 0.0  -> Forces alignment decisions based strictly on 3D structure, ignoring sequence divergence
+# --tmscore 0.80    -> Threshold to group shapes. A TM-score >0.80 means highly structural structural convergence.
+# --tmscore-mode 1  -> Evaluates alignment based on the TM-score normalized by the shorter sequence length
+# -c 0.80           -> Requires 80% coverage overlap across the structural interfaces
+
+# 4. Extract Cluster Centers (The 5-10 dominant structural families that converged)
+echo "Extracting representative models..."
+mmseqs result2repseq \
+  "$STRUCT_DB_DIR/af3_models_db" \
+  "$STRUCT_DB_DIR/af3_structural_clusters" \
+  "$STRUCT_DB_DIR/af3_representatives_db"
+
+# 5. Export structural assignments to a human-readable TSV format
+# File columns: [Cluster Center Model Name, Member Model Name]
+mmseqs createtsv \
+  "$STRUCT_DB_DIR/af3_models_db" \
+  "$STRUCT_DB_DIR/af3_models_db" \
+  "$STRUCT_DB_DIR/af3_structural_clusters" \
+  "$STRUCT_DB_DIR/final_structural_assignments.tsv"
+
+echo "MMseqs2 structural 3D matrix calculation complete. File saved."
+
+##############  following MMseqs2 for  Rosetta InterfaceAnalyzer
+### Step 7+  Pipeline Transition: Target Sequence Count Extraction
+Once final_structural_assignments.tsv is compiled, run this brief Python script to count which configurations converged most frequently across the stochastic seeds.
+It automatically isolates the PDB structural models that should pass forward into Rosetta InterfaceAnalyzer.
+
+import pandas as pd
+
+# Load the cluster assignments generated by MMseqs2
+df_clusters = pd.read_csv("./structural_clustering/final_structural_assignments.tsv", sep="\t", names=["Representative", "Member"])
+
+# Calculate size metrics for each converged conformation cluster
+cluster_rankings = df_clusters['Representative'].value_counts().reset_index()
+cluster_rankings.columns = ['Model_Path', 'Convergence_Seed_Count']
+
+print("==========================================================")
+print("   TOP CONVERGED STRUCTURAL FAMILIES (Surviving Leads)   ")
+print("==========================================================")
+print(cluster_rankings.head(10))
+
+# Export the paths of the top 5-10 structural centers for Rosetta InterfaceAnalyzer execution
+top_leads = cluster_rankings.head(10)['Model_Path'].tolist()
+with open("./structural_clustering/rosetta_input_models.txt", "w") as f:
+    for model in top_leads:
+        f.write(f"{model}\n")
+
+print("\nSaved file list to pass immediately to Rosetta InterfaceAnalyzer.")
+#################################################################################
+
+####  Step 8: Complete Binding Interface Evaluation (Rosetta InterfaceAnalyzer)
+Extract quantitative structural metrics from the verified structural clusters.
+
+# Calculate interface surface energy, binding delta G, and spatial packing statistics
+InterfaceAnalyzer.default.linuxgccrelease \
+  -s final_converged_af3_complexes.pdb \
+  -compute_packstat true \
+  -packstat::oversample 100 \
+  -tracer_data_file candidate_interface_metrics.sf \
+  -out:file:score_only interface_scores.txt
+
+#### Step 9: Multi-Objective Lead Selection (MOO Matrix Execution)
+Balance binding metrics against manufacturing liabilities using a Multi-Objective Optimization selection script.
+
+import pandas as pd
+import numpy as np
+
+# Load interface metrics and biophysical profiles
+df_rosetta = pd.read_csv("interface_scores.txt", sep="\s+") # Contains dG_cross / packstat
+df_biophys = pd.read_csv("biophysical_passed_variants.csv") # Contains CamSol score
+
+# Combine metrics onto surviving variants
+df_moo = df_rosetta.merge(df_biophys, on="id")
+
+# Implement min-max feature scaling normalization functions
+def min_max_normalize(series, invert=False):
+    if invert:
+        return (series.max() - series) / (series.max() - series.min())
+    return (series - series.min()) / (series.max() - series.min())
+
+# We want to minimize Rosetta dG (lower is stronger affinity) and maximize CamSol (higher is soluble)
+df_moo['norm_affinity'] = min_max_normalize(df_moo['dG_cross'], invert=True)
+df_moo['norm_solubility'] = min_max_normalize(df_moo['camsol'], invert=False)
+
+# Compute Pareto Fitness Optimization Balance (Weighted 60% Affinity / 40% Solubility)
+df_moo['Pareto_Fitness'] = (0.60 * df_moo['norm_affinity']) + (0.40 * df_moo['norm_solubility'])
+df_leads = df_moo.sort_values(by="Pareto_Fitness", ascending=False)
+
+# Export finalized structural lead candidates
+df_leads.head(5).to_csv("FINAL_THERAPEUTIC_LEADS_MOO.csv", index=False)
+print("Multi-Objective Lead optimization finished. Top functional sequences stored.")
+
+
+
+
+
+
+
+
+
+
